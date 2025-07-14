@@ -1,6 +1,7 @@
 const StellarSdk = require('stellar-sdk');
 const ed25519 = require('ed25519-hd-key');
 const bip39 = require('bip39');
+const inquirer = require('inquirer');
 require("dotenv").config();
 
 // =================================================================
@@ -9,133 +10,260 @@ require("dotenv").config();
 const server = new StellarSdk.Server('https://api.mainnet.minepi.com');
 const PI_NETWORK_PASSPHRASE = 'Pi Network';
 
-// Ambil konfigurasi dari file .env
-const SOURCE_MNEMONIC = process.env.SOURCE_MNEMONIC;
-const SPONSOR_MNEMONIC = process.env.SPONSOR_MNEMONIC;
-const RECIPIENT_ADDRESS = process.env.RECEIVER_ADDRESS;
-
-// --- ⚙️ PENGATURAN PENTING ---
-// Masukkan ID Saldo yang Anda dapatkan dari skrip find_balances.js
-const BALANCE_ID_TO_CLAIM = "00000000........................................................";
-// Kekuatan transaksi: berapa kali operasi diulang dalam 1 transaksi.
-// Semakin tinggi, semakin kuat menembus jaringan sibuk, tapi fee lebih mahal. (1 - 50)
-const OPERATION_COUNT = 25; 
-const LOOP_INTERVAL_MS = 449; // Jeda antar percobaan dalam milidetik
+// Variabel global untuk menyimpan data antar langkah
+let availableBalances = [];
+let sourceKeypair, sponsorKeypair;
 
 // =================================================================
-// 2. FUNGSI UTAMA (TOOLKIT)
+// 2. FUNGSI-FUNGSI UTAMA (TOOLKIT)
 // =================================================================
 
-/**
- * Menghasilkan Keypair (public & secret) dari mnemonic.
- * @param {string} mnemonic - Seed phrase.
- * @returns {Promise<StellarSdk.Keypair>} Keypair object.
- */
 async function getKeypair(mnemonic) {
-    if (!bip39.validateMnemonic(mnemonic)) throw new Error("Mnemonic tidak valid.");
+    if (!bip39.validateMnemonic(mnemonic)) throw new Error(`Mnemonic tidak valid: "${mnemonic.slice(0, 10)}..."`);
     const seed = await bip39.mnemonicToSeed(mnemonic);
     const { key } = ed25519.derivePath("m/44'/314159'/0'", seed.toString('hex'));
     return StellarSdk.Keypair.fromRawEd25519Seed(key);
 }
 
-/**
- * Fungsi inti untuk mengklaim dan mengirim saldo terkunci menggunakan sponsor.
- * @param {StellarSdk.Keypair} sourceKeypair - Keypair pemilik saldo terkunci.
- * @param {StellarSdk.Keypair} sponsorKeypair - Keypair pembayar biaya.
- * @param {string} recipientAddress - Alamat tujuan.
- * @param {string} balanceId - ID dari saldo yang akan diklaim.
- * @returns {Promise<object>} Hasil submit transaksi.
- */
-async function claimAndSend(sourceKeypair, sponsorKeypair, recipientAddress, balanceId) {
-    // 1. Muat akun sponsor untuk mendapatkan sequence number dan membayar fee
-    const sponsorAccount = await server.loadAccount(sponsorKeypair.publicKey());
-    
-    // 2. Dapatkan detail saldo terkunci untuk mengetahui jumlahnya
+async function findClaimableBalances(publicKey) {
+    console.log("\n🔍 Mencari saldo terkunci untuk alamat:", publicKey);
+    const response = await server.claimableBalances().claimant(publicKey).limit(200).call();
+    return response.records;
+}
+
+async function claimAndSend(sourceKp, sponsorKp, recipientAddress, balanceId, operationCount) {
+    const sponsorAccount = await server.loadAccount(sponsorKp.publicKey());
     const claimableBalance = await server.claimableBalances().claimableBalance(balanceId).call();
+    
     if (!claimableBalance || !claimableBalance.amount) {
         throw new Error(`Saldo dengan ID ${balanceId} tidak ditemukan atau tidak valid.`);
     }
     const amountToSend = claimableBalance.amount;
-    console.log(`✅ Ditemukan saldo ${amountToSend} PI dengan ID: ${balanceId}`);
+    console.log(`✅ Ditemukan saldo ${amountToSend} PI.`);
 
-    // 3. Bangun transaksi dengan sponsor
+    const baseFee = await server.fetchBaseFee();
     const transaction = new StellarSdk.TransactionBuilder(sponsorAccount, {
-        fee: (100 * OPERATION_COUNT).toString(), // Fee disesuaikan dengan jumlah operasi
+        fee: ((2 * operationCount) * parseInt(baseFee)).toString(),
         networkPassphrase: PI_NETWORK_PASSPHRASE,
     });
 
-    console.log(`🚀 Membangun transaksi dengan ${OPERATION_COUNT} operasi...`);
-    // 4. Tambahkan operasi berulang kali untuk "kekuatan"
-    for (let i = 0; i < OPERATION_COUNT; i++) {
+    console.log(`🚀 Membangun transaksi dengan ${operationCount} kekuatan...`);
+    for (let i = 0; i < operationCount; i++) {
         transaction
-            // Operasi 1: Klaim saldo, sumbernya adalah dompet 'source'
             .addOperation(StellarSdk.Operation.claimClaimableBalance({
                 balanceId: balanceId,
-                source: sourceKeypair.publicKey(), // PENTING: sumber operasi adalah pemilik saldo
+                source: sourceKp.publicKey(),
             }))
-            // Operasi 2: Kirim pembayaran, sumbernya juga dompet 'source'
             .addOperation(StellarSdk.Operation.payment({
                 destination: recipientAddress,
                 asset: StellarSdk.Asset.native(),
                 amount: amountToSend,
-                source: sourceKeypair.publicKey(), // PENTING: yang mengirim adalah pemilik saldo
+                source: sourceKp.publicKey(),
             }));
     }
     
     const builtTx = transaction.setTimeout(30).build();
-
-    // 5. Tandatangani transaksi dengan DUA kunci
-    builtTx.sign(sponsorKeypair); // Sponsor tanda tangan untuk bayar fee
-    builtTx.sign(sourceKeypair);  // Sumber tanda tangan untuk otorisasi klaim & kirim
+    builtTx.sign(sponsorKp);
+    builtTx.sign(sourceKp);
 
     console.log("📡 Mengirimkan transaksi ke jaringan...");
     return server.submitTransaction(builtTx);
 }
 
 // =================================================================
-// 3. LOGIKA UTAMA BOT
+// 3. FUNGSI LOGIKA BOT (LOOPING)
 // =================================================================
-async function runBot() {
+
+async function startTransferLoop(config) {
+    const { sourceKp, sponsorKp, recipient, balanceId, operationCount, loopInterval } = config;
+    let attempt = 0;
+
+    const execute = async () => {
+        attempt++;
+        console.log(`\n--- Percobaan #${attempt} ---`);
+        try {
+            const result = await claimAndSend(sourceKp, sponsorKp, recipient, balanceId, operationCount);
+
+            if (result && result.hash) {
+                console.log("\n🎉 Transaksi BERHASIL dan TERKONFIRMASI!");
+                console.log("✅ Hash:", result.hash);
+                console.log(`🔗 Explorer: https://api.mainnet.minepi.com/transactions/${result.hash}`);
+                console.log("Bot berhenti.");
+                return; // Sukses, hentikan loop
+            } else {
+                console.warn("⚠️ Transaksi terkirim tapi konfirmasi hash tidak diterima. Mencoba lagi...");
+                console.log("Detail Respons Server:", result);
+                setTimeout(execute, loopInterval);
+            }
+        } catch (e) {
+            const errorCode = e.response?.data?.extras?.result_codes?.transaction;
+            if (errorCode === 'tx_bad_seq') {
+                console.warn("⚠️ BENTROK (tx_bad_seq): Jaringan sibuk. Mencoba lagi...");
+            } else if (errorCode === 'tx_insufficient_balance') {
+                console.error("❌ GAGAL TOTAL: Saldo dompet SPONSOR tidak cukup! Bot berhenti.");
+                return; // Gagal total, hentikan loop
+            } else {
+                const errorMessage = e.response?.data?.extras || e.response?.data || e.message;
+                console.error("❌ Error:", JSON.stringify(errorMessage, null, 2));
+            }
+            console.log(`Mencoba lagi dalam ${loopInterval / 1000} detik...`);
+            setTimeout(execute, loopInterval);
+        }
+    };
+    
+    await execute();
+}
+
+// =================================================================
+// 4. ALUR KERJA INTERAKTIF
+// =================================================================
+
+async function step1_viewBalances() {
+    const answers = await inquirer.prompt([
+        {
+            type: 'password',
+            name: 'mnemonic',
+            message: 'Masukkan Mnemonic DOMPET SUMBER (yang memiliki saldo terkunci):',
+            mask: '*',
+            default: process.env.SOURCE_MNEMONIC || '',
+            validate: input => bip39.validateMnemonic(input) || 'Mnemonic tidak valid. Silakan periksa kembali.',
+        },
+    ]);
+
     try {
-        if (!SOURCE_MNEMONIC || !SPONSOR_MNEMONIC || !RECIPIENT_ADDRESS) {
-            throw new Error("Harap lengkapi SOURCE_MNEMONIC, SPONSOR_MNEMONIC, dan RECEIVER_ADDRESS di .env");
-        }
-        if (!BALANCE_ID_TO_CLAIM.startsWith("00000000")) {
-             throw new Error("Harap isi BALANCE_ID_TO_CLAIM dengan ID yang valid.");
-        }
+        sourceKeypair = await getKeypair(answers.mnemonic);
+        availableBalances = await findClaimableBalances(sourceKeypair.publicKey());
 
-        console.log("Memulai bot klaim & kirim...");
-        const sourceKeypair = await getKeypair(SOURCE_MNEMONIC);
-        const sponsorKeypair = await getKeypair(SPONSOR_MNEMONIC);
-
-        console.log("Dompet Sumber  :", sourceKeypair.publicKey());
-        console.log("Dompet Sponsor :", sponsorKeypair.publicKey());
-        console.log("Dompet Penerima:", RECIPIENT_ADDRESS);
-        
-        const result = await claimAndSend(sourceKeypair, sponsorKeypair, RECIPIENT_ADDRESS, BALANCE_ID_TO_CLAIM);
-
-        console.log("\n🎉 Transaksi BERHASIL!");
-        console.log("✅ Hash Transaksi:", result.hash);
-        console.log(`🔗 Lihat di Explorer: https://api.mainnet.minepi.com/transactions/${result.hash}`);
-        console.log("Bot akan berhenti karena tugas selesai.");
-
-    } catch (e) {
-        const errorCode = e.response?.data?.extras?.result_codes?.transaction;
-        if (errorCode === 'tx_bad_seq') {
-            console.warn("⚠️ BENTROK TRANSAKSI (tx_bad_seq): Jaringan sibuk atau bot lain menang. Mencoba lagi...");
-        } else if (errorCode === 'tx_insufficient_balance') {
-            console.error("❌ GAGAL: Saldo dompet SPONSOR tidak cukup untuk membayar biaya transaksi!");
-            return; // Berhenti jika sponsor kehabisan dana
+        if (availableBalances.length === 0) {
+            console.log("\nℹ️ Tidak ada saldo terkunci yang ditemukan untuk dompet ini.");
+            return false; // Gagal, tidak ada saldo
         } else {
-            console.error("❌ Terjadi Error:", e.response?.data?.extras || e.message);
+            console.log(`\n✅ Ditemukan ${availableBalances.length} saldo terkunci:`);
+            availableBalances.forEach((balance, index) => {
+                console.log(`   [${index + 1}] ${balance.amount} PI (ID: ${balance.id.slice(0, 15)}...)`);
+            });
+            return true; // Sukses, ada saldo
         }
-        // Atur untuk mencoba lagi setelah jeda
-        setTimeout(runBot, LOOP_INTERVAL_MS);
+    } catch (error) {
+        console.error("\n❌ Gagal mengambil data:", error.message);
+        return false;
+    }
+}
+
+async function step2_transferConfig() {
+    const balanceChoices = availableBalances.map((b, i) => ({
+        name: `${b.amount} PI (ID: ${b.id.slice(0, 20)}...)`,
+        value: b.id
+    }));
+
+    const answers = await inquirer.prompt([
+        {
+            type: 'list',
+            name: 'balanceId',
+            message: 'Pilih Saldo Terkunci yang akan dikirim:',
+            choices: balanceChoices,
+        },
+        {
+            type: 'password',
+            name: 'sponsorMnemonic',
+            message: 'Masukkan Mnemonic DOMPET SPONSOR (yang membayar fee):',
+            mask: '*',
+            default: process.env.SPONSOR_MNEMONIC || '',
+            validate: input => bip39.validateMnemonic(input) || 'Mnemonic tidak valid. Silakan periksa kembali.',
+        },
+        {
+            type: 'input',
+            name: 'recipient',
+            message: 'Masukkan Alamat Dompet PENERIMA:',
+            default: process.env.RECIPIENT_ADDRESS || '',
+            validate: input => StellarSdk.StrKey.isValidEd25519PublicKey(input) || 'Alamat dompet penerima tidak valid.',
+        },
+        {
+            type: 'input',
+            name: 'operationCount',
+            message: 'Masukkan Kekuatan Transaksi (1-50):',
+            default: 25,
+            validate: val => (parseInt(val) > 0 && parseInt(val) <= 50) || 'Masukkan angka antara 1 dan 50.',
+            filter: Number,
+        },
+        {
+            type: 'input',
+            name: 'schedule',
+            message: 'Jadwalkan transfer (biarkan kosong untuk sekarang) (YYYY-MM-DDTHH:mm):'
+        }
+    ]);
+
+    try {
+        sponsorKeypair = await getKeypair(answers.sponsorMnemonic);
+    } catch (error) {
+        console.error("\n❌ Mnemonic Sponsor tidak valid:", error.message);
+        return; // Hentikan proses
+    }
+
+    const config = {
+        sourceKp: sourceKeypair,
+        sponsorKp: sponsorKeypair,
+        recipient: answers.recipient,
+        balanceId: answers.balanceId,
+        operationCount: answers.operationCount,
+        loopInterval: 1000,
+    };
+
+    if (answers.schedule) {
+        const scheduledDate = new Date(answers.schedule);
+        const now = new Date();
+        const delay = scheduledDate.getTime() - now.getTime();
+
+        if (delay <= 0) {
+            console.log("⚠️ Waktu jadwal sudah lewat. Memulai transfer sekarang...");
+            await startTransferLoop(config);
+        } else {
+            console.log(`✅ Transfer dijadwalkan untuk: ${scheduledDate.toLocaleString('id-ID')}`);
+            console.log(`Bot akan mulai dalam ${Math.round(delay / 1000 / 60)} menit.`);
+            setTimeout(() => {
+                console.log("\n⏰ Waktu jadwal telah tiba! Memulai proses transfer...");
+                startTransferLoop(config);
+            }, delay);
+        }
+    } else {
+        await startTransferLoop(config);
     }
 }
 
 
+async function mainMenu() {
+    console.clear();
+    console.log("======================================");
+    console.log("  PI NETWORK - CLAIM & TRANSFER BOT   ");
+    console.log("======================================");
+
+    const { action } = await inquirer.prompt([
+        {
+            type: 'list',
+            name: 'action',
+            message: 'Pilih tindakan yang ingin Anda lakukan:',
+            choices: [
+                { name: '1. Lihat Saldo Terkunci & Lanjutkan ke Transfer', value: 'transfer' },
+                { name: '2. Keluar', value: 'exit' },
+            ],
+        },
+    ]);
+
+    if (action === 'transfer') {
+        const hasBalances = await step1_viewBalances();
+        if (hasBalances) {
+            await step2_transferConfig();
+        } else {
+            console.log("\nProses dihentikan karena tidak ada saldo yang bisa ditransfer.");
+            // Beri kesempatan untuk kembali ke menu utama atau keluar
+        }
+    } else {
+        console.log("Terima kasih telah menggunakan bot ini. Sampai jumpa!");
+        process.exit(0);
+    }
+}
+
 // =================================================================
-// 4. JALANKAN BOT
+// 5. JALANKAN BOT
 // =================================================================
-runBot();
+mainMenu();
